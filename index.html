@@ -98,7 +98,7 @@
     .qc-note { font-size: 0.68rem; }
     @media (max-width: 1200px) { .main-grid { grid-template-columns: 300px minmax(0, 1fr); grid-template-areas: "controls viz" "history history" "right right"; } }
     @media (max-width: 860px) {
-      .main-grid { grid-template-columns: 1fr; grid-template-areas: "controls" "viz" "history" "right"; }
+      .main-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "controls" "viz" "history" "right"; }
       .controls-card { align-self: start; }
     }
     .card { background: var(--card); border: 1px solid var(--card-border); border-radius: 1.1rem; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; box-shadow: var(--shadow); }
@@ -192,6 +192,10 @@
     .hud-val { color: var(--foreground); font-weight: 700; }
     .vis-bottom-bar { padding: 0.8rem 1rem; background: #fff; display: flex; align-items: center; gap: 1rem; }
     .timeline-scrubber { flex: 1; }
+    .gfx-toggle { display: flex; align-items: center; gap: 4px; flex-shrink: 0; font-size: 0.74rem; font-weight: 600; color: var(--muted); }
+    .gfx-btn { background: #eef4fc; border: none; color: var(--foreground); padding: 4px 10px; border-radius: 9999px; font: inherit; font-size: 0.72rem; font-weight: 600; cursor: pointer; }
+    .gfx-btn:hover { background: #dbe8f8; }
+    .gfx-btn.active { background: var(--primary); color: #fff; }
 
     /* Telemetry */
     .telemetry-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; }
@@ -510,6 +514,11 @@
 
         <div class="vis-bottom-bar">
           <input type="range" class="slider timeline-scrubber" id="timeline-scrubber" min="0" max="1000" value="0">
+          <div class="gfx-toggle" title="Low graphics turns off shadows, draws fewer trees and clouds and runs at 30 fps, for phones and older laptops.">
+            Graphics
+            <button class="gfx-btn" data-gfx="high">High</button>
+            <button class="gfx-btn" data-gfx="low">Low</button>
+          </div>
         </div>
       </section>
 
@@ -1356,6 +1365,7 @@ def versions_json():
         foliage.setColorAt(i, tint.setHSL(0.3 + Math.random() * 0.06, 0.55, 0.3 + Math.random() * 0.1));
       }
       scene.add(trunks, foliage);
+      forest = { trunks, foliage, total: TREES };
 
       // Lake
       const lake = new THREE.Mesh(new THREE.CircleGeometry(300, 48), new THREE.MeshStandardMaterial({ color: 0x3fa9f5, roughness: 0.15, metalness: 0.3, transparent: true, opacity: 0.92 }));
@@ -1400,7 +1410,7 @@ def versions_json():
 
     function spawnDust(x, z, n, power) {
       for (let k = 0; k < n; k++) {
-        const p = dustPuffs.find(q => q.life <= 0);
+        const p = dustPuffs.find((q, i) => q.life <= 0 && (GFX.mode === 'high' || i < 20));
         if (!p) return;
         const a = Math.random() * Math.PI * 2, sp = (6 + Math.random() * 16) * power;
         p.sp.position.set(x + Math.cos(a) * 4, 3 + Math.random() * 2, z + Math.sin(a) * 4);
@@ -1437,6 +1447,75 @@ def versions_json():
       document.getElementById('canvas-hint').classList.toggle('hidden', mode !== 'start');
     }
 
+    // --- GRAPHICS QUALITY: High (shadows, full scenery, sharp) or Low (phones and older laptops) ---
+    // Low draws at 1x resolution without shadows or anti-aliasing, shows fewer trees, clouds and dust,
+    // and caps the frame rate at 30 fps. The physics is identical in both modes.
+    const GFX_KEY = 'descent-graphics-v1';
+    const GFX = { mode: 'high', chosen: false, lastRender: 0, lastUi: 0, frames: [] };
+    let sunLight, forest;
+    const FLOWN_MAX = 8000;   // flown-path points kept (over 2 minutes at 60 fps)
+
+    function detectLowEndDevice() {
+      const phone = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 820;
+      const fewCores = (navigator.hardwareConcurrency || 8) <= 4;
+      const lowMemory = (navigator.deviceMemory || 8) <= 4;
+      let softwareGpu = false;
+      try {
+        const gl = document.createElement('canvas').getContext('webgl');
+        const info = gl && gl.getExtension('WEBGL_debug_renderer_info');
+        if (info) softwareGpu = /swiftshader|llvmpipe|software|basic render/i.test(gl.getParameter(info.UNMASKED_RENDERER_WEBGL));
+        const lose = gl && gl.getExtension('WEBGL_lose_context');
+        if (lose) lose.loseContext();
+      } catch (e) {}
+      return phone || fewCores || lowMemory || softwareGpu;
+    }
+
+    (function pickGfxMode() {
+      let saved = null;
+      try { saved = localStorage.getItem(GFX_KEY); } catch (e) {}
+      if (saved === 'high' || saved === 'low') { GFX.mode = saved; GFX.chosen = true; }
+      else GFX.mode = detectLowEndDevice() ? 'low' : 'high';
+    })();
+
+    function applyGfx() {
+      const low = GFX.mode === 'low';
+      if (renderer) {
+        renderer.setPixelRatio(low ? 1 : Math.min(window.devicePixelRatio, 2));
+        if (renderer.shadowMap.enabled === low) {
+          renderer.shadowMap.enabled = !low;
+          scene.traverse(o => { if (o.material) [].concat(o.material).forEach(m => { m.needsUpdate = true; }); });
+        }
+      }
+      if (sunLight) sunLight.castShadow = !low;
+      if (flameLight) flameLight.visible = !low;          // a moving point light is costly on weak GPUs
+      clouds.forEach((c, i) => { c.visible = !low || i % 3 === 0; });
+      if (forest) forest.trunks.count = forest.foliage.count = low ? 160 : forest.total;
+      document.querySelectorAll('.gfx-btn').forEach(b => b.classList.toggle('active', b.dataset.gfx === GFX.mode));
+    }
+
+    function setGfxMode(mode, byUser) {
+      GFX.mode = mode;
+      if (byUser) {
+        GFX.chosen = true;
+        try { localStorage.setItem(GFX_KEY, mode); } catch (e) {}
+      }
+      applyGfx();
+    }
+
+    // If High turns out too slow on this device (and the viewer never picked a mode), drop to Low once.
+    function watchFrameRate(time) {
+      if (GFX.chosen || GFX.mode !== 'high' || document.visibilityState !== 'visible') { GFX.frames.length = 0; return; }
+      const f = GFX.frames;
+      f.push(time);
+      if (f.length < 120) return;
+      const avg = (f[f.length - 1] - f[0]) / (f.length - 1);
+      f.shift();
+      if (avg > 28 && avg < 250) {   // under ~35 fps (very long gaps mean the tab was in the background)
+        console.info(`Descent: ${(1000 / avg).toFixed(0)} fps on High graphics, switching to Low.`);
+        setGfxMode('low', false);
+      }
+    }
+
     // --- THREE.JS 3D SCENE & RENDERER SETUP ---
     let scene, camera, renderer, controls;
     let rocketMesh, flameMesh, flameLight, trajectoryLine, flownLine, coneMesh, gimbalPivot;
@@ -1457,7 +1536,8 @@ def versions_json():
       camera = new THREE.PerspectiveCamera(45, width / height, 1, 9000);
       camera.position.set(...DEFAULT_CAM_POS);
 
-      renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true });
+      // anti-aliasing can only be chosen when the WebGL context is created, so it follows the mode at page load
+      renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: GFX.mode === 'high', powerPreference: 'high-performance' });
       renderer.setSize(width, height);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       renderer.shadowMap.enabled = true;
@@ -1471,7 +1551,7 @@ def versions_json():
       const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
       scene.add(ambientLight);
 
-      const sunLight = new THREE.DirectionalLight(0xfffaed, 1.2);
+      sunLight = new THREE.DirectionalLight(0xfffaed, 1.2);
       sunLight.position.set(400, 900, 500);
       sunLight.castShadow = true;
       scene.add(sunLight);
@@ -1630,12 +1710,20 @@ def versions_json():
       scene.add(trajectoryLine);
 
       const flownMat = new THREE.LineDashedMaterial({ color: 0xf97316, dashSize: 5, gapSize: 3 });
+      // filled in place as the rocket flies (rebuilding the whole line every frame got slower as it grew)
       const flownGeo = new THREE.BufferGeometry();
+      flownGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(FLOWN_MAX * 3), 3));
+      flownGeo.setAttribute('lineDistance', new THREE.BufferAttribute(new Float32Array(FLOWN_MAX), 1));
+      flownGeo.setDrawRange(0, 0);
       flownLine = new THREE.Line(flownGeo, flownMat);
+      flownLine.frustumCulled = false;
+      flownLine.userData = { src: null, n: 0 };
       scene.add(flownLine);
 
       window.addEventListener('resize', onWindowResize);
       setupCameraControls();
+      document.querySelectorAll('.gfx-btn').forEach(b => b.addEventListener('click', () => setGfxMode(b.dataset.gfx, true)));
+      applyGfx();
     }
 
     function onWindowResize() {
@@ -1771,6 +1859,9 @@ def versions_json():
     // animation keeps going while the optimizer works. If workers are unavailable the
     // same code runs on the main thread instead (slower, the scene pauses during solves).
     const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.27.7/full/';
+    // Same files on jsDelivr's second network, tried if the first download stalls or fails
+    const PYODIDE_MIRROR = 'https://fastly.jsdelivr.net/pyodide/v0.27.7/full/';
+    const LOAD_STALL_MS = 90000;   // no download progress for this long = give up on that attempt
     const PY_PACKAGES = ['numpy', 'scipy', 'clarabel', 'cvxpy-base'];
     const GFOLD_PY = document.getElementById('gfold-py').textContent;
 
@@ -1784,8 +1875,12 @@ def versions_json():
             say('Downloading the Pyodide runtime...');
             importScripts(m.indexURL + 'pyodide.js');
             const py = await loadPyodide({ indexURL: m.indexURL, stdout: say, stderr: say });
-            say('Loading ' + m.packages.join(', ') + ' ...');
-            await py.loadPackage(m.packages, { messageCallback: say, errorCallback: say });
+            // one package at a time, so a slow connection still reports progress
+            for (let i = 0; i < m.packages.length; i++) {
+              say('Downloading ' + m.packages[i] + ' (' + (i + 1) + ' of ' + m.packages.length + ' packages)...');
+              await py.loadPackage(m.packages[i], { messageCallback: () => {}, errorCallback: say });
+            }
+            say('Starting CVXPY...');
             py.runPython(m.code);
             solveJson = py.globals.get('solve_json');
             self.postMessage({ type: 'ready', versions: py.runPython('versions_json()') });
@@ -1809,19 +1904,46 @@ def versions_json():
       busy: 0,              // solves in flight
       loadMs: 0,
       _worker: null, _pending: new Map(), _nextId: 1, _initPromise: null, _mainSolve: null,
+      _lastProgress: 0,
       onLog: () => {},
+      onProgress: () => {},   // short status while loading, e.g. "Loaded scipy (2 of 4 packages)"
+
+      // Every download message counts as progress; the stall watchdog only fires when nothing arrives.
+      _progress(text) {
+        this._lastProgress = performance.now();
+        const line = text.trim().split('\n').pop();
+        if (line) this.onProgress(line);
+      },
+
+      // Rejects if an attempt makes no progress for LOAD_STALL_MS (a download that hangs never errors).
+      _withStallTimer(attempt) {
+        this._lastProgress = performance.now();
+        let timer;
+        const stalled = new Promise((_, reject) => {
+          timer = setInterval(() => {
+            if (performance.now() - this._lastProgress > LOAD_STALL_MS)
+              reject(new Error(`no download progress for ${LOAD_STALL_MS / 1000} s`));
+          }, 2000);
+        });
+        return Promise.race([attempt, stalled]).finally(() => clearInterval(timer));
+      },
 
       init() {
         if (this._initPromise) return this._initPromise;
         const t0 = performance.now();
         this._setState('loading');
-        this._initPromise = this._initWorker()
-          .catch(err => {
-            console.warn('CVXPY worker failed, retrying on the main thread:', err);
-            if (this._worker) { this._worker.terminate(); this._worker = null; }
-            this.onLog(`Background worker unavailable (${err.message || err}). Loading on the main thread instead.\n`);
-            return this._initMainThread();
-          })
+        const dropWorker = () => { if (this._worker) { this._worker.terminate(); this._worker = null; } };
+        const retry = (what, next) => err => {
+          console.warn(`CVXPY load failed (${err.message || err}), trying ${what}`);
+          dropWorker();
+          this.onLog(`Load failed (${err.message || err}). Trying ${what}…\n`);
+          this.onProgress(`Retrying with ${what}…`);
+          return this._withStallTimer(next());
+        };
+        // 1) background worker, main CDN  2) background worker, mirror CDN  3) main thread, mirror CDN
+        this._initPromise = this._withStallTimer(this._initWorker(PYODIDE_URL))
+          .catch(retry('a backup download server', () => this._initWorker(PYODIDE_MIRROR)))
+          .catch(retry('loading without a background thread', () => this._initMainThread(PYODIDE_MIRROR)))
           .then(() => {
             this.loadMs = performance.now() - t0;
             this.onLog(`Ready: CVXPY ${this.versions.cvxpy}, Clarabel ${this.versions.clarabel}, NumPy ${this.versions.numpy} (${this.backend}, loaded in ${(this.loadMs / 1000).toFixed(1)} s)\n`);
@@ -1836,7 +1958,7 @@ def versions_json():
         return this._initPromise;
       },
 
-      _initWorker() {
+      _initWorker(indexURL) {
         return new Promise((resolve, reject) => {
           const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
           const w = new Worker(url);
@@ -1845,7 +1967,7 @@ def versions_json():
           w.onerror = e => { e.preventDefault(); reject(new Error(e.message || 'worker script error')); };
           w.onmessage = e => {
             const m = e.data;
-            if (m.type === 'log') this.onLog(m.text);
+            if (m.type === 'log') { this.onLog(m.text); this._progress(m.text); }
             else if (m.type === 'ready') { this.versions = JSON.parse(m.versions); this.backend = 'worker'; resolve(); }
             else if (m.type === 'init-error') reject(new Error(m.message));
             else if (m.type === 'result' || m.type === 'solve-error') {
@@ -1856,23 +1978,28 @@ def versions_json():
               else job.reject(new Error(m.message));
             }
           };
-          w.postMessage({ type: 'init', indexURL: PYODIDE_URL, packages: PY_PACKAGES, code: GFOLD_PY });
+          w.postMessage({ type: 'init', indexURL, packages: PY_PACKAGES, code: GFOLD_PY });
         });
       },
 
-      async _initMainThread() {
+      async _initMainThread(indexURL) {
+        const say = t => { this.onLog(t + '\n'); this._progress(t); };
         if (typeof loadPyodide === 'undefined') {
+          say('Downloading the Pyodide runtime...');
           await new Promise((resolve, reject) => {
             const s = document.createElement('script');
-            s.src = PYODIDE_URL + 'pyodide.js';
+            s.src = indexURL + 'pyodide.js';
             s.onload = resolve;
             s.onerror = () => reject(new Error('could not download pyodide.js from the CDN'));
             document.head.appendChild(s);
           });
         }
-        const say = t => this.onLog(t + '\n');
-        const py = await loadPyodide({ indexURL: PYODIDE_URL, stdout: say, stderr: say });
-        await py.loadPackage(PY_PACKAGES, { messageCallback: say, errorCallback: say });
+        const py = await loadPyodide({ indexURL, stdout: say, stderr: say });
+        for (let i = 0; i < PY_PACKAGES.length; i++) {
+          say(`Downloading ${PY_PACKAGES[i]} (${i + 1} of ${PY_PACKAGES.length} packages)...`);
+          await py.loadPackage(PY_PACKAGES[i], { messageCallback: () => {}, errorCallback: say });
+        }
+        say('Starting CVXPY...');
         py.runPython(GFOLD_PY);
         const fn = py.globals.get('solve_json');
         this._mainSolve = req => fn(req);
@@ -2000,6 +2127,7 @@ def versions_json():
         if (Cvx.state !== 'ready') {
           setEngineLabel('CVXPY · loading Python…');
           statusEl.textContent = 'Loading Python + CVXPY in your browser (first time takes a while)…';
+          Cvx.onProgress = line => { if (gen === STATE.planGen) statusEl.textContent = `Loading Python + CVXPY in your browser: ${line}`; };
         }
         await Cvx.init();
         await sleep(120);                                   // let slider drags settle
@@ -2036,7 +2164,7 @@ def versions_json():
         if (gen !== STATE.planGen) return;
         console.warn('CVXPY plan failed:', err);
         setEngineLabel('CVXPY unavailable');
-        statusEl.textContent = `CVXPY could not run here (${err.message || err}). Using the fast solver.`;
+        statusEl.textContent = `CVXPY could not start (${err.message || err}). Using the fast solver. Click "CVXPY (Wasm)" to try again; if it keeps failing, this network may block cdn.jsdelivr.net (common on school or work Wi-Fi), so try another network or an up-to-date Chrome, Edge or Firefox.`;
       } finally {
         if (gen === STATE.planGen) {
           STATE.cvxPending = false;
@@ -2093,11 +2221,23 @@ def versions_json():
       trajectoryLine.geometry.setFromPoints(points);
     }
 
+    // Appends only the new points since the last call; a new flownPath array (a reset) starts over.
     function updateFlownPathMesh() {
-      if (!flownLine || STATE.flownPath.length < 2) return;
-      const points = STATE.flownPath.map(p => new THREE.Vector3(p.x, p.z + ROCKET_Y, p.y));
-      flownLine.geometry.setFromPoints(points);
-      flownLine.computeLineDistances();
+      if (!flownLine) return;
+      const path = STATE.flownPath, d = flownLine.userData, geo = flownLine.geometry;
+      if (d.src !== path) { d.src = path; d.n = 0; }
+      const pos = geo.attributes.position, dist = geo.attributes.lineDistance;
+      const end = Math.min(path.length, FLOWN_MAX);
+      if (end === d.n) return;
+      for (let i = d.n; i < end; i++) {
+        const p = path[i];
+        pos.setXYZ(i, p.x, p.z + ROCKET_Y, p.y);
+        dist.setX(i, i === 0 ? 0 : dist.getX(i - 1) + Math.hypot(p.x - path[i - 1].x, p.y - path[i - 1].y, p.z - path[i - 1].z));
+      }
+      d.n = end;
+      pos.needsUpdate = true;
+      dist.needsUpdate = true;
+      geo.setDrawRange(0, end >= 2 ? end : 0);
     }
 
     // --- TELEMETRY GRAPHS WITH DYNAMIC TIME POSITION INDICATOR DOTS ---
@@ -2301,6 +2441,10 @@ def versions_json():
 
     function animateThreeJS(time) {
       requestAnimationFrame(animateThreeJS);
+      // Low graphics: draw at most ~30 frames per second (the physics step below uses the real elapsed time)
+      if (GFX.mode === 'low' && time - GFX.lastRender < 30) return;
+      GFX.lastRender = time;
+      watchFrameRate(time);
 
       const dt = Math.min(0.04, (time - lastTick) / 1000.0);
       lastTick = time;
@@ -2462,9 +2606,14 @@ def versions_json():
         STATE.flownPath.push({ x: cur.x, y: cur.y, z: cur.z });
         updateFlownPathMesh();
 
-        // Update Timeline
-        const progress = Math.min(1000, (STATE.currentTime / STATE.totalTime) * 1000);
-        document.getElementById('timeline-scrubber').value = progress;
+        // Numbers, charts and the timeline are redrawn 20x per second (5x on Low), not every frame:
+        // rebuilding the charts forces the browser to lay the page out again, which is slow on phones.
+        const uiDue = time - GFX.lastUi >= (GFX.mode === 'low' ? 200 : 50);
+        if (uiDue) {
+          GFX.lastUi = time;
+          const progress = Math.min(1000, (STATE.currentTime / STATE.totalTime) * 1000);
+          document.getElementById('timeline-scrubber').value = progress;
+        }
 
         // --- DEFINITIVE TOUCHDOWN LOGIC: ENGINE CUT & PERMANENT PAD LOCK ---
         if (cur.z <= 0.0) {
@@ -2500,8 +2649,10 @@ def versions_json():
           recordLanding(padDist, vTouch);
         }
 
-        updateHUD();
-        updateTelemetryGraphs(STATE.plannedTrajectory);
+        if (uiDue || STATE.hasLanded) {
+          updateHUD();
+          updateTelemetryGraphs(STATE.plannedTrajectory);
+        }
       }
 
       // Update 3D Rocket Object Position & Attitude
