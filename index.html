@@ -843,12 +843,19 @@ def build_problem(N):
         a_max=cp.Parameter(nonneg=True), a_min=cp.Parameter(nonneg=True),
         cos_theta=cp.Parameter(nonneg=True), tan_gs=cp.Parameter(nonneg=True),
         gate_alt=cp.Parameter(nonneg=True), gate_speed=cp.Parameter(nonneg=True),
+        # measured push from wind and drag (a constant acceleration over the plan), pre-multiplied
+        # by dt and dt^2/2 so the problem stays DPP (a parameter times a parameter would not be)
+        dv_dist=cp.Parameter((3, 1)), dr_dist=cp.Parameter((3, 1)),
+        # the body turns at a limited rate, so sideways thrust can only change so much per step;
+        # u_now is the sideways thrust the rocket has right now (the plan has to start from it)
+        lat_step=cp.Parameter(nonneg=True), lat_first=cp.Parameter(nonneg=True), u_now=cp.Parameter(2),
     )
     r = cp.Variable((3, N + 1))  # position [downrange, crossrange, altitude]
     v = cp.Variable((3, N + 1))  # velocity
     u = cp.Variable((3, N))      # thrust acceleration
     s = cp.Variable(N)           # slack: upper bound on ||u|| (the convexification)
     grav = np.tile(np.array([[0.0], [0.0], [-G0]]), (1, N))
+    ones = np.ones((1, N))
 
     cons = [
         r[:, 0] == p["r0"], v[:, 0] == p["v0"],
@@ -859,12 +866,14 @@ def build_problem(N):
         # slow state too (the throttle floor can make a fast exact speed unreachable).
         r[0:2, N] == 0, r[2, N] == p["gate_alt"],
         v[0:2, N] == 0, v[2, N] >= -p["gate_speed"], v[2, N] <= 0,
-        v[:, 1:] == v[:, :-1] + p["dt"] * u + p["dt"] * grav,
-        r[:, 1:] == r[:, :-1] + p["dt"] * v[:, :-1] + p["h2"] * u + p["h2"] * grav,
+        v[:, 1:] == v[:, :-1] + p["dt"] * u + p["dt"] * grav + p["dv_dist"] @ ones,
+        r[:, 1:] == r[:, :-1] + p["dt"] * v[:, :-1] + p["h2"] * u + p["h2"] * grav + p["dr_dist"] @ ones,
         cp.norm(u, 2, axis=0) <= s,                      # second-order cone
         s >= p["a_min"], s <= p["a_max"],                # throttle limits (non-convex in u, convex in s)
         u[2, :] >= p["cos_theta"] * s,                   # thrust pointing cone
         p["tan_gs"] * cp.norm(r[0:2, 1:], 2, axis=0) <= r[2, 1:],  # glide-slope cone
+        cp.norm(u[0:2, 1:] - u[0:2, :-1], 2, axis=0) <= p["lat_step"],  # sideways thrust slew rate
+        cp.norm(u[0:2, 0] - p["u_now"], 2) <= p["lat_first"],
     ]
     prob = cp.Problem(cp.Minimize(p["dt"] * cp.sum(s)), cons)  # minimise total delta-v (fuel)
     return prob, p, (r, v, u, s)
@@ -904,6 +913,9 @@ def solve_json(req_text):
     p["tan_gs"].value = float(np.tan(np.radians(q["glide_deg"])))
     p["gate_alt"].value = float(q.get("gate_alt", 0.0))
     p["gate_speed"].value = float(q.get("gate_speed", 0.0))
+    a_dist = np.array(q.get("a_dist", [0.0, 0.0, 0.0]), dtype=float).reshape(3, 1)
+    lat_slew = q.get("lat_slew")   # m/s^3; absent = no turn-rate limit (the textbook problem)
+    p["u_now"].value = np.array(q.get("u_now", [0.0, 0.0]), dtype=float)
 
     tried, best = [], None
 
@@ -913,6 +925,10 @@ def solve_json(req_text):
         dt = tf / N
         p["dt"].value = dt
         p["h2"].value = 0.5 * dt * dt
+        p["dv_dist"].value = dt * a_dist
+        p["dr_dist"].value = 0.5 * dt * dt * a_dist
+        p["lat_step"].value = 1e3 if lat_slew is None else float(lat_slew) * dt
+        p["lat_first"].value = 1e3 if lat_slew is None or "u_now" not in q else float(lat_slew) * dt
         t0 = time.perf_counter()
         try:
             prob.solve(solver=cp.CLARABEL, verbose=bool(q.get("verbose", False)))
@@ -969,7 +985,9 @@ def solve_json(req_text):
     # If the current arrival time became impossible, the search lands exactly on the edge of what is
     # feasible (no slack at all). For in-flight re-plans, then fly a slightly longer one so the real
     # vehicle has room to correct. (Only then: adding it every time would keep pushing the arrival back.)
-    pushed_later = best is not None and "tf_search" in q and best["tf"] > float(q["tf_search"][0]) + 1e-3
+    # (A later arrival that is merely a little cheaper does not count: the first tf tried is the current one.)
+    current_ok = bool(tried) and tried[0]["deltaV"] is not None
+    pushed_later = best is not None and ("tf_search" in q or q.get("first_feasible")) and not current_ok
     if pushed_later and q.get("tf_margin"):
         cheapest, best = best, None
         if try_tf(cheapest["tf"] + float(q["tf_margin"])) == float("inf"):
@@ -1008,6 +1026,7 @@ def versions_json():
       rho0: 1.225,
       vibAmp: 1.5,
       dragCoeff: 0.0008,
+      distEst: [0, 0, 0],   // measured wind + drag acceleration (m/s²), fed to CVXPY
       mpcEnabled: true,
 
       // Engine Selection
@@ -2048,6 +2067,23 @@ def versions_json():
     // braking profile expects at 15 m, so the hand-over is seamless. That also works for engines whose
     // minimum thrust beats gravity (they can't hover, so a slow gate would be unreachable).
     const GATE_ALT = 15.0;
+    // The touchdown controller takes over this many seconds before the plan reaches the gate. With a fixed
+    // arrival time, a small sideways error needs (error / time left²) of acceleration, so the last plans
+    // asked for hard sideways thrust and the slow-turning rocket swung past the pad.
+    const HANDOVER_EARLY = 2.5;
+
+    // How fast sideways thrust can change (m/s³): turning at the max turn rate swings the planned
+    // full thrust sideways at about a_max × turn rate. Keeps plans the rocket can actually follow.
+    function lateralSlew() {
+      return cvxVehicleParams().a_max * VEHICLE.maxTurnRate;
+    }
+
+    // Only the sideways part of the measured wind + drag push goes into the plan: it is what makes the
+    // rocket drift off the pad. Vertical drag is strong at high speed but fades as the rocket slows, so
+    // treating it as constant would be badly wrong; leaving it out is the safe side (it only helps braking).
+    function sidewaysPush() {
+      return [STATE.distEst[0], STATE.distEst[1], 0];
+    }
     function terminalBrakeAccel(aMax) {
       return Math.min(6.0, Math.max(1.0, 0.6 * Math.max(0.5, aMax - STATE.g)));
     }
@@ -2139,7 +2175,7 @@ def versions_json():
         const t0 = performance.now();
         const res = await Cvx.solve({
           r0: [STATE.x0, STATE.y0, STATE.z0], v0: [STATE.vx0, STATE.vy0, STATE.vz0],
-          N: STATE.N, tf_search: search, ...cvxVehicleParams()
+          N: STATE.N, tf_search: search, a_dist: sidewaysPush(), lat_slew: lateralSlew(), ...cvxVehicleParams()
         });
         if (gen !== STATE.planGen) return;
         const wall = performance.now() - t0;
@@ -2181,7 +2217,7 @@ def versions_json():
       if (!p || Cvx.state !== 'ready' || Cvx.busy) return;
       if (STATE.currentTime - STATE.lastReplanAt < interval) return;
       const remaining = p.t0 + p.tf - STATE.currentTime;
-      if (remaining < 2.0) return;   // close to the ground the touchdown controller takes over
+      if (remaining < HANDOVER_EARLY) return;   // the touchdown controller takes over from here
 
       const gen = STATE.planGen;
       const tReq = STATE.currentTime;
@@ -2192,10 +2228,18 @@ def versions_json():
         r0: [cur.x + noise(vib * 0.1), cur.y + noise(vib * 0.1), cur.z + noise(vib * 0.1)],
         v0: [cur.vx + noise(vib), cur.vy + noise(vib), cur.vz + noise(vib)],
         N: 30,
-        // free final time on every re-plan: keep the cheapest arrival at or after the current one
-        // (an earlier arrival would mean an aggressive plan with no margin for the real vehicle)
-        tf_search: [+remaining.toFixed(2), +(remaining + 6.0).toFixed(2), 0.5],
-        tf_margin: 0.75,
+        // Keep the arrival time of the first (fuel-optimal) plan; only if it has become impossible, take the
+        // first feasible later one. Searching for the cheapest later arrival on every re-plan, or adding a
+        // safety margin each time, let small tracking lags push the arrival back again and again: every
+        // extra second has to be spent braking, and the rocket ended up hovering (~120 kg instead of ~80).
+        tfs: Array.from({ length: 25 }, (_, i) => +(remaining + 0.25 * i).toFixed(2)),
+        first_feasible: true,
+        a_dist: sidewaysPush(),  // wind push measured in flight
+        lat_slew: lateralSlew(),
+        u_now: (() => {           // sideways thrust the rocket actually has right now
+          const a = cur.throttle * STATE.amax * Math.sin(cur.tilt * Math.PI / 180);
+          return [a * Math.cos(cur.azimuth), a * Math.sin(cur.azimuth)];
+        })(),
         ...cvxVehicleParams()
       };
       const t0 = performance.now();
@@ -2480,12 +2524,15 @@ def versions_json():
         // min thrust beats gravity: the fast solver can't plan for that, but a CVXPY plan already respects the throttle floor
         const hoverImpossible = aMaxNow * STATE.minThrottleRatio >= STATE.g * 0.98 && !(STATE.engineMode === 'cvxpy' && STATE.cvxPlan);
         const cvxPlanDone = STATE.engineMode === 'cvxpy' && STATE.cvxPlan
-          && STATE.currentTime > STATE.cvxPlan.t0 + STATE.cvxPlan.tf;     // reached the 15 m gate
+          && STATE.currentTime > STATE.cvxPlan.t0 + STATE.cvxPlan.tf - HANDOVER_EARLY;   // (nearly) at the 15 m gate
         // safety nets against lingering: low over the pad and not drifting, or a CVXPY flight that
         // re-planning has stretched well past its original plan -> just do the final descent
         const overPadLowAndSlow = cur.z < 3 * TD_ALT && Math.hypot(cur.x, cur.y) < 10 && Math.hypot(cur.vx, cur.vy) < 3;
         const cvxOverdue = STATE.engineMode === 'cvxpy' && STATE.cvxInitialTf && STATE.currentTime > STATE.cvxInitialTf + 8.0;
-        const useTerminal = cur.z < TD_ALT || cur.vz > 0.5 || hoverImpossible || cur.z < stopDist + TD_ALT * 0.5
+        // A CVXPY plan already brakes as late as the engine allows, so its safety net only fires when even
+        // full power can no longer stop the rocket above the gate (the fast solver keeps a wider margin).
+        const tooFast = STATE.engineMode === 'cvxpy' && STATE.cvxPlan ? cur.z < stopDist * 0.95 + TD_ALT * 0.25 : cur.z < stopDist + TD_ALT * 0.5;
+        const useTerminal = cur.z < TD_ALT || cur.vz > 0.5 || hoverImpossible || tooFast
           || cvxPlanDone || overPadLowAndSlow || cvxOverdue
           || STATE.currentTime > STATE.totalTime + 3.0; // plan expired: stop hovering around, just land
         if (!useTerminal && STATE.engineMode === 'cvxpy' && STATE.cvxPlan) {
@@ -2559,7 +2606,10 @@ def versions_json():
           // gentle gain: the body needs time to rotate, an aggressive loop would make it swing
           let axCmd = 1.2 * (vxT - cur.vx);
           let ayCmd = 1.2 * (vyT - cur.vy);
-          const hMax = Math.max(uzCmd, 4.0) * Math.tan(tiltCap * Math.PI / 180.0);
+          // ...and close to the ground at most 2.5 m/s² sideways: during the final braking burn the allowed
+          // tilt times nearly full thrust pushed sideways hard, and the slow-turning body overshot the pad.
+          // Higher up the full authority stays (a hoverslam flies its whole descent on this controller).
+          const hMax = Math.min(2.5 + 0.25 * Math.max(0, cur.z - TD_ALT), Math.max(uzCmd, 4.0) * Math.tan(tiltCap * Math.PI / 180.0));
           const hMag = Math.hypot(axCmd, ayCmd);
           if (hMag > hMax) { axCmd *= hMax / hMag; ayCmd *= hMax / hMag; }
           let thrustCmd = Math.hypot(axCmd, ayCmd, uzCmd);
@@ -2602,6 +2652,13 @@ def versions_json():
         cur.vx += ax * dt;
         cur.vy += ay * dt;
         cur.vz += az * dt;
+
+        // What an accelerometer would report beyond engine + gravity: the push of wind and drag.
+        // Smoothed over ~0.5 s, it goes into every CVXPY plan as a constant force.
+        const kd = 1 - Math.exp(-dt / 0.5), D = STATE.distEst;
+        D[0] += (ax - ux - D[0]) * kd;
+        D[1] += (ay - uy - D[1]) * kd;
+        D[2] += (az - uz + STATE.g - D[2]) * kd;
 
         STATE.flownPath.push({ x: cur.x, y: cur.y, z: cur.z });
         updateFlownPathMesh();
@@ -2747,11 +2804,16 @@ def versions_json():
       updateFormulation();
       updateQuickCheck();
       STATE.startWhenReady = false;
+      STATE.cvxPending = false;   // a plan still running for the old settings no longer counts
       STATE.lastReplanAt = -1;
       STATE.isPlaying = false;
       STATE.hasLanded = false;
       STATE.currentTime = 0.0;
       STATE.gustImpulse = { x: 0.0, y: 0.0 };
+      // starting guess for the wind + drag push: drag at the initial velocity in the steady wind
+      const vr = [STATE.vx0 - STATE.windX, STATE.vy0 - STATE.windY, STATE.vz0];
+      const kDrag = 0.5 * STATE.rho0 * STATE.dragCoeff * Math.hypot(...vr);
+      STATE.distEst = vr.map(c => -kDrag * c);
       STATE.flownPath = [{ x: STATE.x0, y: STATE.y0, z: STATE.z0 }];
       STATE.currentRocketState = {
         x: STATE.x0,
@@ -2953,12 +3015,14 @@ def versions_json():
     // --- LANDING HISTORY: one entry per touchdown, kept in this browser only ---
     const HISTORY_KEY = 'descent-landing-history-v1';
     let landingHistory = [];
-    try { landingHistory = JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch (e) { landingHistory = []; }
+    // A saved row with a missing or non-numeric value (NaN is stored as null) would break the page, so skip it
+    const validLanding = h => h && h.setup && ['dist', 'speed', 'fuel', 'time'].every(k => Number.isFinite(h[k]));
+    try { landingHistory = (JSON.parse(localStorage.getItem(HISTORY_KEY)) || []).filter(validLanding); } catch (e) { landingHistory = []; }
 
     function recordLanding(dist, speed) {
       const L = STATE.lcvx;
       const usedCvx = STATE.engineMode === 'cvxpy' && L && L.plans > 0;
-      landingHistory.unshift({
+      const row = {
         n: (landingHistory[0] ? landingHistory[0].n : 0) + 1,
         solver: usedCvx ? 'cvxpy' : (STATE.engineMode === 'cvxpy' ? 'fallback' : 'fast'),
         weather: STATE.randomWeather,
@@ -2967,7 +3031,9 @@ def versions_json():
         time: STATE.currentTime,
         setup: { z0: STATE.z0, vz0: STATE.vz0, amax: STATE.amax, minthr: STATE.minThrottleRatio, theta: STATE.thetaMaxDeg, wind: Math.hypot(STATE.windX, STATE.windY) },
         lcvx: usedCvx ? { plans: L.plans, maxGap: L.maxGap, floor: L.floor / L.nodes, max: L.max / L.nodes, tilt: L.tilt / L.nodes } : null
-      });
+      };
+      if (!validLanding(row)) return;
+      landingHistory.unshift(row);
       landingHistory = landingHistory.slice(0, 40);
       try { localStorage.setItem(HISTORY_KEY, JSON.stringify(landingHistory)); } catch (e) { /* storage unavailable: keep it in memory */ }
       renderHistory();
