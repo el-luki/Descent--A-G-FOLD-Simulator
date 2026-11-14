@@ -1878,8 +1878,9 @@ def versions_json():
     // animation keeps going while the optimizer works. If workers are unavailable the
     // same code runs on the main thread instead (slower, the scene pauses during solves).
     const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.27.7/full/';
-    // Same files on jsDelivr's second network, tried if the first download stalls or fails
-    const PYODIDE_MIRROR = 'https://fastly.jsdelivr.net/pyodide/v0.27.7/full/';
+    // Same files on another of jsDelivr's networks, tried if the first download stalls or fails.
+    // (Measured on a slow connection: cdn and fastly ran at ~8 KB/s, gcore delivered SciPy's 13.5 MB in ~6 s.)
+    const PYODIDE_MIRROR = 'https://gcore.jsdelivr.net/pyodide/v0.27.7/full/';
     const LOAD_STALL_MS = 90000;   // no download progress for this long = give up on that attempt
     const PY_PACKAGES = ['numpy', 'scipy', 'clarabel', 'cvxpy-base'];
     const GFOLD_PY = document.getElementById('gfold-py').textContent;
