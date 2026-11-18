@@ -31,6 +31,16 @@ All solutions: throttle within 20–80 %, thrust within the pointing limit, larg
 | 90° | 201.8 kg, 46.96 s | 200.9 kg, 46.18 s |
 | 45° | 222.3 kg, 57.29 s | 209.6 kg, 52.64 s |
 
+## Is the gap from the discretization? No.
+
+[discretization-test.csv](discretization-test.csv): fuel at the paper's flight times for two methods
+(exact zero-order hold, forward Euler) and N = 25, 50, 100, 200 steps. The unconstrained case stays at
+198.97–199.22 kg, the 90° case at 200.96–201.25 kg and the 45° case at 220.98–221.53 kg. None of these
+choices closes the ~1 kg gap to the paper, so the cause is something the paper does not list (for example
+the exact gravity value, solver tolerances or how fuel was reported). It remains unexplained.
+
+## Flight-time search
+
 For 45° the fuel keeps rising with flight time (52.64 s → 209.6 kg, 55 s → 214.5 kg, 57.29 s → 221.0 kg),
 so the cheapest landing is the earliest feasible one. Our discretization finds 52.6 s still feasible;
 the paper's search stopped at 57.29 s. At equal flight times the two agree within 0.6 %.

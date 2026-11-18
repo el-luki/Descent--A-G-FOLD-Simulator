@@ -43,21 +43,23 @@ def skew(w):
     return np.array([[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]])
 
 
-def discretize(dt):
-    """Exact zero-order-hold discretization of xdot = A x + B (g + u), x = (r, v)."""
+def discretize(dt, method="zoh"):
+    """Discretize xdot = A x + B (g + u), x = (r, v): exact zero-order hold, or forward Euler."""
     S = skew(OMEGA)
     A = np.block([[np.zeros((3, 3)), np.eye(3)], [-S @ S, -2.0 * S]])
     B = np.vstack([np.zeros((3, 3)), np.eye(3)])
+    if method == "euler":
+        return np.eye(6) + A * dt, B * dt
     M = np.zeros((9, 9))
     M[:6, :6], M[:6, 6:] = A * dt, B * dt
     E = expm(M)
     return E[:6, :6], E[:6, 6:]          # Phi, Gamma_d
 
 
-def solve(tf, N=120, theta_deg=None, glide_deg=None, vmax=None):
+def solve(tf, N=120, theta_deg=None, glide_deg=None, vmax=None, method="zoh"):
     """Minimum-fuel landing for a fixed flight time tf. Returns dict or None if infeasible."""
     dt = tf / N
-    Phi, Gd = discretize(dt)
+    Phi, Gd = discretize(dt, method)
     x = cp.Variable((6, N + 1))
     z = cp.Variable(N + 1)               # ln(mass)
     u = cp.Variable((3, N))              # thrust / mass

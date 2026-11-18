@@ -2413,7 +2413,11 @@ def versions_json():
       // for (the part that stops the fall), even while the body is still turning toward the command.
       const tAct = Math.hypot(cur.q[0], cur.q[1]);
       const vertWanted = cur.throttle * Math.cos(tCmd);
-      const thrTarget = Math.min(1.0, vertWanted / Math.max(0.3, Math.cos(tAct)));
+      // While following a plan the engine can't throttle below its floor, whatever the plan asks for, so a
+      // plan that ignores the floor gets the floor anyway. (Simplification: the touchdown controller in the
+      // last ~15 m may go below it, down to ~0.6 g, to settle gently.)
+      const floor = cur.followingPlan ? STATE.minThrottleRatio : 0;
+      const thrTarget = Math.min(1.0, Math.max(floor, vertWanted / Math.max(0.3, Math.cos(tAct))));
       cur.thrAct += (thrTarget - cur.thrAct) * (1 - Math.exp(-dt / VEHICLE.throttleTau));
 
       // from here on, cur.* describes the real vehicle
@@ -2627,6 +2631,7 @@ def versions_json():
 
         // The guidance above only set commands. The vehicle turns and throttles at a finite
         // rate; after this call cur.throttle/tilt/azimuth hold what the rocket is actually doing.
+        cur.followingPlan = !useTerminal;
         actuate(cur, dt);
 
         // 3D Dynamics Integration (thrust along the rocket's actual axis)
